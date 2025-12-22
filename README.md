@@ -1,5 +1,4 @@
-Here is the **updated README.md content** with a **clear, explicit tip** added about running **frontend and backend in two different terminals**.
-You can **replace your existing README.md** with this version or copy only the **TIP section** if you prefer.
+
 
 ---
 

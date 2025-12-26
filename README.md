@@ -13,7 +13,7 @@ This repository contains a **Multimodal Retrieval-Augmented Generation (RAG) Cha
 **The backend and frontend must be running in two separate terminals.**
 
 * The **backend (FastAPI)** runs on port `8000`
-* The **frontend (Vercel / Next.js)** runs on port `3000`
+* The **frontend (Vercel / Node.js)** runs on port `3000`
 
 Both servers must be running **at the same time** for the application to work correctly.
 

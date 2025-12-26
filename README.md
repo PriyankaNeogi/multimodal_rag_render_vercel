@@ -184,7 +184,7 @@ http://localhost:3000
   Handles PDF upload, embedding, retrieval, and LLM responses
 
 * **Terminal 2**
-  Runs Next.js frontend
+  Runs Node.js frontend
   Sends requests to backend APIs and displays responses
 
 If **either terminal is stopped**, the application will not function.

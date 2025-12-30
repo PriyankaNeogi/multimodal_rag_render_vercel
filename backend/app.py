@@ -4,27 +4,23 @@
 import os
 import logging
 import torch
+import io
+import base64
+import fitz  # PyMuPDF
+
+from PIL import Image
+from typing import Optional
+from dotenv import load_dotenv
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-
 torch.set_grad_enabled(False)
 
-from dotenv import load_dotenv
 load_dotenv()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY:
     raise RuntimeError("GROQ_API_KEY not found")
-
-# =========================
-# CORE IMPORTS
-# =========================
-import io
-import fitz  # PyMuPDF
-import base64
-from PIL import Image
-from typing import Optional
 
 # =========================
 # FASTAPI
@@ -37,7 +33,7 @@ from pydantic import BaseModel
 # =========================
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
+from langchain_community.vectorstores import Chroma
 from langchain_groq import ChatGroq
 
 # =========================
@@ -58,22 +54,20 @@ app = FastAPI(title="Multimodal RAG (Groq + CLIP)")
 device = "cpu"
 
 # =========================
-# GLOBAL MODELS (LAZY)
+# LOAD CLIP
 # =========================
 clip_model: Optional[CLIPModel] = None
 clip_processor: Optional[CLIPProcessor] = None
 
+
 def load_clip():
     global clip_model, clip_processor
-
     if clip_model is None or clip_processor is None:
         logger.info("Loading CLIP model...")
         clip_model = CLIPModel.from_pretrained(
             "openai/clip-vit-base-patch32",
             low_cpu_mem_usage=True
-        )
-        clip_model.to(device)
-        clip_model.eval()
+        ).to(device).eval()
 
         clip_processor = CLIPProcessor.from_pretrained(
             "openai/clip-vit-base-patch32",
@@ -81,8 +75,9 @@ def load_clip():
         )
         logger.info("CLIP loaded")
 
+
 # =========================
-# EMBEDDINGS
+# EMBEDDING FUNCTIONS
 # =========================
 def embed_text(text: str):
     load_clip()
@@ -97,7 +92,8 @@ def embed_text(text: str):
         features = clip_model.get_text_features(**inputs)
 
     features = features / features.norm(dim=-1, keepdim=True)
-    return features.squeeze().cpu().numpy()
+    return features.squeeze().cpu().numpy().tolist()
+
 
 def embed_image(image: Image.Image):
     load_clip()
@@ -106,16 +102,22 @@ def embed_image(image: Image.Image):
         features = clip_model.get_image_features(**inputs)
 
     features = features / features.norm(dim=-1, keepdim=True)
-    return features.squeeze().cpu().numpy()
+    return features.squeeze().cpu().numpy().tolist()
+
 
 # =========================
-# GLOBAL STORES
+# VECTOR STORE (PERSISTENT)
 # =========================
-vector_store: Optional[FAISS] = None
+vector_store = Chroma(
+    collection_name="multimodal_rag",
+    persist_directory="./chroma_db",
+    embedding_function=embed_text
+)
+
 image_store = {}
 
 # =========================
-# GROQ LLM
+# LLM
 # =========================
 llm = ChatGroq(
     groq_api_key=GROQ_API_KEY,
@@ -129,9 +131,9 @@ class QueryRequest(BaseModel):
     question: str
 
 # =========================
-# ROOT + HEALTH (RENDER FIX)
+# ROOT
 # =========================
-@app.api_route("/", methods=["GET", "HEAD"])
+@app.get("/")
 def root():
     return {"status": "ok"}
 
@@ -140,23 +142,16 @@ def root():
 # =========================
 @app.post("/upload-pdf")
 def upload_pdf(file: UploadFile = File(...)):
-    global vector_store, image_store
-
-    if file.size and file.size > 5 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="PDF too large (max 5MB)")
-
     try:
-        logger.info("PDF upload started")
         pdf_bytes = file.file.read()
         pdf = fitz.open(stream=pdf_bytes, filetype="pdf")
-
-        docs = []
-        embeddings = []
 
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=500,
             chunk_overlap=100
         )
+
+        documents = []
 
         for page_num, page in enumerate(pdf):
 
@@ -167,36 +162,26 @@ def upload_pdf(file: UploadFile = File(...)):
                     page_content=text,
                     metadata={"page": page_num, "type": "text"}
                 )
-                chunks = splitter.split_documents([temp_doc])
-
-                for chunk in chunks:
-                    emb = embed_text(chunk.page_content)
-                    docs.append(chunk)
-                    embeddings.append(emb)
+                documents.extend(splitter.split_documents([temp_doc]))
 
             # ---- IMAGES ----
             for img_index, img in enumerate(page.get_images(full=True)):
-                try:
-                    xref = img[0]
-                    base_image = pdf.extract_image(xref)
-                    image_bytes = base_image["image"]
+                xref = img[0]
+                base_image = pdf.extract_image(xref)
+                image_bytes = base_image["image"]
 
-                    pil_image = Image.open(
-                        io.BytesIO(image_bytes)
-                    ).convert("RGB")
+                pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
-                    image_id = f"page_{page_num}_img_{img_index}"
+                image_id = f"page_{page_num}_img_{img_index}"
+                buffered = io.BytesIO()
+                pil_image.save(buffered, format="PNG")
 
-                    buffered = io.BytesIO()
-                    pil_image.save(buffered, format="PNG")
+                image_store[image_id] = base64.b64encode(
+                    buffered.getvalue()
+                ).decode()
 
-                    image_store[image_id] = base64.b64encode(
-                        buffered.getvalue()
-                    ).decode()
-
-                    emb = embed_image(pil_image)
-
-                    image_doc = Document(
+                documents.append(
+                    Document(
                         page_content=f"[IMAGE on page {page_num}]",
                         metadata={
                             "page": page_num,
@@ -204,33 +189,20 @@ def upload_pdf(file: UploadFile = File(...)):
                             "image_id": image_id
                         }
                     )
-
-                    docs.append(image_doc)
-                    embeddings.append(emb)
-
-                except Exception as img_err:
-                    logger.error(f"Image error: {img_err}")
+                )
 
         pdf.close()
 
-        vector_store = FAISS.from_embeddings(
-            text_embeddings=[
-                (doc.page_content, emb)
-                for doc, emb in zip(docs, embeddings)
-            ],
-            embedding=None,
-            metadatas=[doc.metadata for doc in docs]
-        )
-
-        logger.info("PDF indexed successfully")
+        vector_store.add_documents(documents)
+        vector_store.persist()
 
         return {
             "status": "PDF indexed",
-            "chunks": len(docs)
+            "chunks": len(documents)
         }
 
     except Exception as e:
-        logger.exception("PDF processing failed")
+        logger.exception("PDF upload failed")
         raise HTTPException(status_code=500, detail=str(e))
 
 # =========================
@@ -238,13 +210,12 @@ def upload_pdf(file: UploadFile = File(...)):
 # =========================
 @app.post("/query")
 def query_rag(request: QueryRequest):
-    if vector_store is None:
+
+    if vector_store._collection.count() == 0:
         raise HTTPException(status_code=400, detail="No document indexed")
 
-    query_embedding = embed_text(request.question)
-
-    results = vector_store.similarity_search_by_vector(
-        embedding=query_embedding,
+    results = vector_store.similarity_search(
+        request.question,
         k=5
     )
 
@@ -280,7 +251,7 @@ Answer clearly and accurately.
     return {"answer": response.content}
 
 # =========================
-# LOCAL DEV ONLY
+# LOCAL DEV
 # =========================
 if __name__ == "__main__":
     import uvicorn

@@ -1,3 +1,5 @@
+"use client";
+
 import ChatUI from "@/components/ChatUI";
 
 export default function Home() {
@@ -7,4 +9,3 @@ export default function Home() {
     </main>
   );
 }
-

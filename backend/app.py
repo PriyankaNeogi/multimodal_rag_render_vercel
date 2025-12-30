@@ -54,16 +54,20 @@ app = FastAPI(title="Multimodal RAG (Groq + CLIP)")
 device = "cpu"
 
 # =========================
-# LOAD CLIP
+# GLOBAL CLIP MODELS
 # =========================
 clip_model: Optional[CLIPModel] = None
 clip_processor: Optional[CLIPProcessor] = None
 
 
+# =========================
+# LOAD CLIP AT STARTUP
+# =========================
 def load_clip():
     global clip_model, clip_processor
+
     if clip_model is None or clip_processor is None:
-        logger.info("Loading CLIP model...")
+        logger.info("Loading CLIP model (startup)...")
         clip_model = CLIPModel.from_pretrained(
             "openai/clip-vit-base-patch32",
             low_cpu_mem_usage=True
@@ -73,14 +77,18 @@ def load_clip():
             "openai/clip-vit-base-patch32",
             use_fast=False
         )
-        logger.info("CLIP loaded")
+        logger.info("CLIP loaded successfully")
+
+
+@app.on_event("startup")
+def startup_event():
+    load_clip()
 
 
 # =========================
 # EMBEDDING FUNCTIONS
 # =========================
 def embed_text(text: str):
-    load_clip()
     with torch.no_grad():
         inputs = clip_processor(
             text=text,
@@ -96,7 +104,6 @@ def embed_text(text: str):
 
 
 def embed_image(image: Image.Image):
-    load_clip()
     with torch.no_grad():
         inputs = clip_processor(images=image, return_tensors="pt")
         features = clip_model.get_image_features(**inputs)
@@ -155,16 +162,16 @@ def upload_pdf(file: UploadFile = File(...)):
 
         for page_num, page in enumerate(pdf):
 
-            # ---- TEXT ----
+            # -------- TEXT --------
             text = page.get_text()
             if text.strip():
-                temp_doc = Document(
+                base_doc = Document(
                     page_content=text,
                     metadata={"page": page_num, "type": "text"}
                 )
-                documents.extend(splitter.split_documents([temp_doc]))
+                documents.extend(splitter.split_documents([base_doc]))
 
-            # ---- IMAGES ----
+            # -------- IMAGES --------
             for img_index, img in enumerate(page.get_images(full=True)):
                 xref = img[0]
                 base_image = pdf.extract_image(xref)
@@ -173,11 +180,11 @@ def upload_pdf(file: UploadFile = File(...)):
                 pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
                 image_id = f"page_{page_num}_img_{img_index}"
-                buffered = io.BytesIO()
-                pil_image.save(buffered, format="PNG")
+                buffer = io.BytesIO()
+                pil_image.save(buffer, format="PNG")
 
                 image_store[image_id] = base64.b64encode(
-                    buffered.getvalue()
+                    buffer.getvalue()
                 ).decode()
 
                 documents.append(

@@ -1,5 +1,9 @@
-import ChatUI from "../components/ChatUI";
+import ChatUI from "@/components/ChatUI";
 
 export default function Home() {
-  return <ChatUI />;
+  return (
+    <main className="min-h-screen p-4">
+      <ChatUI />
+    </main>
+  );
 }

@@ -2,19 +2,13 @@
 # ENVIRONMENT SETUP
 # =========================
 import os
-import logging
-import torch
 import io
 import base64
+import logging
 import fitz  # PyMuPDF
 
 from PIL import Image
-from typing import Optional
 from dotenv import load_dotenv
-
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-torch.set_grad_enabled(False)
 
 load_dotenv()
 
@@ -33,13 +27,13 @@ from pydantic import BaseModel
 # =========================
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
 from langchain_groq import ChatGroq
 
-# =========================
-# TRANSFORMERS (CLIP)
-# =========================
-from transformers import CLIPProcessor, CLIPModel
+# 👉 Lightweight embeddings (MiniLM)
+from langchain_community.embeddings import HuggingFaceEmbeddings
+
+# 👉 Persistent vector DB
+from langchain_community.vectorstores import Chroma
 
 # =========================
 # LOGGING
@@ -50,67 +44,14 @@ logger = logging.getLogger(__name__)
 # =========================
 # APP INIT
 # =========================
-app = FastAPI(title="Multimodal RAG (Groq + CLIP)")
-device = "cpu"
+app = FastAPI(title="Multimodal RAG (MiniLM + Groq)")
 
 # =========================
-# GLOBAL CLIP MODELS
+# EMBEDDING MODEL (LIGHTWEIGHT)
 # =========================
-clip_model: Optional[CLIPModel] = None
-clip_processor: Optional[CLIPProcessor] = None
-
-
-# =========================
-# LOAD CLIP AT STARTUP
-# =========================
-def load_clip():
-    global clip_model, clip_processor
-
-    if clip_model is None or clip_processor is None:
-        logger.info("Loading CLIP model (startup)...")
-        clip_model = CLIPModel.from_pretrained(
-            "openai/clip-vit-base-patch32",
-            low_cpu_mem_usage=True
-        ).to(device).eval()
-
-        clip_processor = CLIPProcessor.from_pretrained(
-            "openai/clip-vit-base-patch32",
-            use_fast=False
-        )
-        logger.info("CLIP loaded successfully")
-
-
-@app.on_event("startup")
-def startup_event():
-    load_clip()
-
-
-# =========================
-# EMBEDDING FUNCTIONS
-# =========================
-def embed_text(text: str):
-    with torch.no_grad():
-        inputs = clip_processor(
-            text=text,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=77
-        )
-        features = clip_model.get_text_features(**inputs)
-
-    features = features / features.norm(dim=-1, keepdim=True)
-    return features.squeeze().cpu().numpy().tolist()
-
-
-def embed_image(image: Image.Image):
-    with torch.no_grad():
-        inputs = clip_processor(images=image, return_tensors="pt")
-        features = clip_model.get_image_features(**inputs)
-
-    features = features / features.norm(dim=-1, keepdim=True)
-    return features.squeeze().cpu().numpy().tolist()
-
+embedding_model = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
+)
 
 # =========================
 # VECTOR STORE (PERSISTENT)
@@ -118,13 +59,14 @@ def embed_image(image: Image.Image):
 vector_store = Chroma(
     collection_name="multimodal_rag",
     persist_directory="./chroma_db",
-    embedding_function=embed_text
+    embedding_function=embedding_model
 )
 
+# Store images as base64 (optional future use)
 image_store = {}
 
 # =========================
-# LLM
+# LLM (GROQ)
 # =========================
 llm = ChatGroq(
     groq_api_key=GROQ_API_KEY,
@@ -167,19 +109,27 @@ def upload_pdf(file: UploadFile = File(...)):
             if text.strip():
                 base_doc = Document(
                     page_content=text,
-                    metadata={"page": page_num, "type": "text"}
+                    metadata={
+                        "page": page_num,
+                        "type": "text"
+                    }
                 )
-                documents.extend(splitter.split_documents([base_doc]))
+                documents.extend(
+                    splitter.split_documents([base_doc])
+                )
 
-            # -------- IMAGES --------
+            # -------- IMAGES (METADATA ONLY) --------
             for img_index, img in enumerate(page.get_images(full=True)):
                 xref = img[0]
                 base_image = pdf.extract_image(xref)
                 image_bytes = base_image["image"]
 
-                pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+                pil_image = Image.open(
+                    io.BytesIO(image_bytes)
+                ).convert("RGB")
 
                 image_id = f"page_{page_num}_img_{img_index}"
+
                 buffer = io.BytesIO()
                 pil_image.save(buffer, format="PNG")
 
@@ -200,6 +150,12 @@ def upload_pdf(file: UploadFile = File(...)):
 
         pdf.close()
 
+        if not documents:
+            raise HTTPException(
+                status_code=400,
+                detail="No content found in PDF"
+            )
+
         vector_store.add_documents(documents)
         vector_store.persist()
 
@@ -219,7 +175,10 @@ def upload_pdf(file: UploadFile = File(...)):
 def query_rag(request: QueryRequest):
 
     if vector_store._collection.count() == 0:
-        raise HTTPException(status_code=400, detail="No document indexed")
+        raise HTTPException(
+            status_code=400,
+            detail="No document indexed"
+        )
 
     results = vector_store.similarity_search(
         request.question,
@@ -230,7 +189,7 @@ def query_rag(request: QueryRequest):
     image_context = []
 
     for doc in results:
-        if doc.metadata["type"] == "text":
+        if doc.metadata.get("type") == "text":
             text_context.append(
                 f"[Page {doc.metadata['page']}]: {doc.page_content}"
             )
@@ -255,7 +214,10 @@ Answer clearly and accurately.
 """
 
     response = llm.invoke(prompt)
-    return {"answer": response.content}
+
+    return {
+        "answer": response.content
+    }
 
 # =========================
 # LOCAL DEV

@@ -26,4 +26,5 @@ langchain-text-splitters
 langchain-groq
 faiss-cpu
 langchain_core
+chromadb
 

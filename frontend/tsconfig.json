@@ -1,38 +1,11 @@
-{
-  "compilerOptions": {
-    "target": "ES2017",
-    "lib": ["dom", "dom.iterable", "esnext"],
+import type { NextConfig } from "next";
+import path from "path";
 
-    "baseUrl": ".",
-
-    "paths": {
-      "@/*": ["./src/*"]
-    },
-
-    "allowJs": true,
-    "skipLibCheck": true,
-    "strict": true,
-    "noEmit": true,
-    "esModuleInterop": true,
-    "module": "esnext",
-    "moduleResolution": "bundler",
-    "resolveJsonModule": true,
-    "isolatedModules": true,
-    "jsx": "react-jsx",
-    "incremental": true,
-
-    "plugins": [
-      { "name": "next" }
-    ]
+const nextConfig: NextConfig = {
+  webpack: (config) => {
+    config.resolve.alias["@"] = path.resolve(__dirname, "src");
+    return config;
   },
+};
 
-  "include": [
-    "next-env.d.ts",
-    "**/*.ts",
-    "**/*.tsx",
-    ".next/types/**/*.ts",
-    ".next/dev/types/**/*.ts"
-  ],
-
-  "exclude": ["node_modules"]
-}
+export default nextConfig;

@@ -2,58 +2,129 @@
 
 import { useState } from "react";
 
-export default function Page() {
-  const [msg, setMsg] = useState("");
-  const [ans, setAns] = useState("");
+export default function Home() {
   const [file, setFile] = useState<File | null>(null);
+  const [question, setQuestion] = useState("");
+  const [answer, setAnswer] = useState("");
+  const [loadingUpload, setLoadingUpload] = useState(false);
+  const [loadingAsk, setLoadingAsk] = useState(false);
+  const [status, setStatus] = useState("");
 
-  async function uploadPdf() {
-    if (!file) return;
+  const BACKEND_URL =
+    process.env.NEXT_PUBLIC_BACKEND_URL || "http://127.0.0.1:8000";
 
-    const form = new FormData();
-    form.append("file", file);
+  // -------------------------
+  // PDF UPLOAD
+  // -------------------------
+  const uploadPDF = async () => {
+    if (!file) {
+      alert("Please select a PDF first");
+      return;
+    }
 
-    await fetch("/api/upload", {
-      method: "POST",
-      body: form,
-    });
+    setLoadingUpload(true);
+    setStatus("Uploading PDF and indexing…");
 
-    alert("PDF uploaded");
-  }
+    const formData = new FormData();
+    formData.append("file", file);
 
-  async function ask() {
-    const res = await fetch("/api/chat", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question: msg }),
-    });
+    try {
+      const res = await fetch(`${BACKEND_URL}/upload-pdf`, {
+        method: "POST",
+        body: formData,
+      });
 
-    const data = await res.json();
-    setAns(data.answer);
-  }
+      const data = await res.json();
+      setStatus(data.status || "PDF uploaded. Indexing in background.");
+    } catch (err) {
+      console.error(err);
+      setStatus("Upload failed");
+    } finally {
+      setLoadingUpload(false);
+    }
+  };
+
+  // -------------------------
+  // ASK QUESTION
+  // -------------------------
+  const askQuestion = async () => {
+    if (!question.trim()) {
+      alert("Please enter a question");
+      return;
+    }
+
+    setLoadingAsk(true);
+    setAnswer("");
+
+    try {
+      const res = await fetch(`${BACKEND_URL}/query`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ question }),
+      });
+
+      const data = await res.json();
+      setAnswer(data.answer || "No answer received");
+    } catch (err) {
+      console.error(err);
+      setAnswer("Error while asking question");
+    } finally {
+      setLoadingAsk(false);
+    }
+  };
 
   return (
-    <div style={{ padding: 20 }}>
-      <h2>Multimodal RAG Chat</h2>
+    <main style={{ padding: "40px", fontFamily: "Arial, sans-serif" }}>
+      <h1>Multimodal RAG Chat</h1>
 
-      <input
-        type="file"
-        accept="application/pdf"
-        onChange={(e) => setFile(e.target.files?.[0] || null)}
-      />
-      <button onClick={uploadPdf}>Upload PDF</button>
+      {/* PDF Upload */}
+      <div style={{ marginBottom: "20px" }}>
+        <input
+          type="file"
+          accept="application/pdf"
+          onChange={(e) => setFile(e.target.files?.[0] || null)}
+        />
+        <br />
+        <button
+          onClick={uploadPDF}
+          disabled={loadingUpload}
+          style={{ marginTop: "10px" }}
+        >
+          {loadingUpload ? "Uploading…" : "Upload PDF"}
+        </button>
+        <p>{status}</p>
+      </div>
 
-      <br /><br />
+      <hr />
 
-      <textarea
-        rows={4}
-        style={{ width: "100%" }}
-        onChange={(e) => setMsg(e.target.value)}
-      />
+      {/* Ask Question */}
+      <div style={{ marginTop: "20px" }}>
+        <textarea
+          rows={4}
+          cols={80}
+          placeholder="Ask a question about the document…"
+          value={question}
+          onChange={(e) => setQuestion(e.target.value)}
+        />
+        <br />
+        <button
+          onClick={askQuestion}
+          disabled={loadingAsk}
+          style={{ marginTop: "10px" }}
+        >
+          {loadingAsk ? "Thinking…" : "Ask"}
+        </button>
+      </div>
 
-      <button onClick={ask}>Ask</button>
-
-      <p>{ans}</p>
-    </div>
+      {/* Answer */}
+      {answer && (
+        <div style={{ marginTop: "30px" }}>
+          <h3>Answer</h3>
+          <p>{answer}</p>
+        </div>
+      )}
+    </main>
   );
 }

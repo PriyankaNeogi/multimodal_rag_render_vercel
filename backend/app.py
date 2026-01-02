@@ -2,7 +2,9 @@
 # ENVIRONMENT SETUP
 # =========================
 import os
+import io
 import gc
+import base64
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -17,16 +19,15 @@ if not GROQ_API_KEY:
 # =========================
 # CORE IMPORTS
 # =========================
-import io
 import fitz  # PyMuPDF
 import torch
-import base64
 from PIL import Image
 
 # =========================
 # FASTAPI
 # =========================
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 # =========================
@@ -46,7 +47,17 @@ from transformers import CLIPProcessor, CLIPModel
 # APP INIT
 # =========================
 app = FastAPI(title="Multimodal RAG (Groq + CLIP)")
-device = "cpu"
+
+# =========================
+# CORS (CRITICAL FIX)
+# =========================
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # =========================
 # GLOBAL STORES
@@ -55,56 +66,45 @@ vector_store = None
 image_store = {}
 
 # =========================
-# LOAD CLIP (EPHEMERAL)
+# LOAD CLIP ONCE
 # =========================
-def load_clip():
-    model = CLIPModel.from_pretrained(
-        "openai/clip-vit-base-patch32",
-        low_cpu_mem_usage=True
-    )
-    model.eval()
+print("Loading CLIP model once...")
 
-    processor = CLIPProcessor.from_pretrained(
-        "openai/clip-vit-base-patch32",
-        use_fast=False
-    )
-    return model, processor
+clip_model = CLIPModel.from_pretrained(
+    "openai/clip-vit-base-patch32",
+    low_cpu_mem_usage=True
+)
+clip_model.eval()
+
+clip_processor = CLIPProcessor.from_pretrained(
+    "openai/clip-vit-base-patch32",
+    use_fast=False
+)
 
 # =========================
 # EMBEDDING FUNCTIONS
 # =========================
 def embed_text(text: str):
-    model, processor = load_clip()
-
     with torch.no_grad():
-        inputs = processor(
+        inputs = clip_processor(
             text=text,
             return_tensors="pt",
             padding=True,
             truncation=True,
             max_length=77
         )
-        features = model.get_text_features(**inputs)
+        features = clip_model.get_text_features(**inputs)
 
     features = features / features.norm(dim=-1, keepdim=True)
-
-    del model, processor, inputs
-    gc.collect()
-
     return features.squeeze().cpu().numpy()
 
-def embed_image(image: Image.Image):
-    model, processor = load_clip()
 
+def embed_image(image: Image.Image):
     with torch.no_grad():
-        inputs = processor(images=image, return_tensors="pt")
-        features = model.get_image_features(**inputs)
+        inputs = clip_processor(images=image, return_tensors="pt")
+        features = clip_model.get_image_features(**inputs)
 
     features = features / features.norm(dim=-1, keepdim=True)
-
-    del model, processor, inputs
-    gc.collect()
-
     return features.squeeze().cpu().numpy()
 
 # =========================
@@ -122,15 +122,10 @@ class QueryRequest(BaseModel):
     question: str
 
 # =========================
-# PDF UPLOAD ENDPOINT
+# BACKGROUND PDF PROCESSOR
 # =========================
-@app.post("/upload-pdf")
-def upload_pdf(file: UploadFile = File(...)):
+def process_pdf(file: UploadFile):
     global vector_store, image_store
-
-    # Safety for Render Free
-    if file.size and file.size > 5 * 1024 * 1024:
-        return {"error": "PDF too large for free tier"}
 
     pdf = fitz.open(stream=file.file.read(), filetype="pdf")
 
@@ -144,18 +139,19 @@ def upload_pdf(file: UploadFile = File(...)):
 
     for page_num, page in enumerate(pdf):
 
-        # ---- TEXT ----
+        # TEXT
         text = page.get_text()
         if text.strip():
             temp_doc = Document(
                 page_content=text,
                 metadata={"page": page_num, "type": "text"}
             )
+
             for chunk in splitter.split_documents([temp_doc]):
                 docs.append(chunk)
                 embeddings.append(embed_text(chunk.page_content))
 
-        # ---- IMAGES ----
+        # IMAGES
         for img_index, img in enumerate(page.get_images(full=True)):
             try:
                 base = pdf.extract_image(img[0])
@@ -169,6 +165,7 @@ def upload_pdf(file: UploadFile = File(...)):
 
                 buf = io.BytesIO()
                 pil_image.save(buf, format="PNG")
+
                 image_store[image_id] = base64.b64encode(
                     buf.getvalue()
                 ).decode()
@@ -183,6 +180,7 @@ def upload_pdf(file: UploadFile = File(...)):
                         }
                     )
                 )
+
                 embeddings.append(embed_image(pil_image))
 
             except Exception as e:
@@ -198,10 +196,19 @@ def upload_pdf(file: UploadFile = File(...)):
         metadatas=[d.metadata for d in docs]
     )
 
-    return {
-        "status": "PDF indexed",
-        "chunks": len(docs)
-    }
+    gc.collect()
+    print(f"PDF indexed with {len(docs)} chunks")
+
+# =========================
+# PDF UPLOAD ENDPOINT
+# =========================
+@app.post("/upload-pdf")
+def upload_pdf(
+    file: UploadFile = File(...),
+    background_tasks: BackgroundTasks = None
+):
+    background_tasks.add_task(process_pdf, file)
+    return {"status": "PDF upload started. Indexing in background."}
 
 # =========================
 # QUERY ENDPOINT
@@ -209,7 +216,7 @@ def upload_pdf(file: UploadFile = File(...)):
 @app.post("/query")
 def query_rag(request: QueryRequest):
     if vector_store is None:
-        return {"error": "No document indexed"}
+        return {"error": "No document indexed yet"}
 
     query_embedding = embed_text(request.question)
 
